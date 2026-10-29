@@ -95,6 +95,10 @@
     min-height:100vh;
   }
 
+  /* hidden until the PIN lock lets it through */
+  html:not(.unlocked) .app,
+  html:not(.unlocked) .toast{ visibility:hidden; }
+
   /* ===== SIDEBAR ===== */
   .sidebar{
     width: 250px;
@@ -1171,6 +1175,10 @@
         <div class="value mono" id="sidebarIncomeTotal">₪0</div>
         <div class="count" id="sidebarIncomeCount">0 רשומות</div>
       </div>
+      <button class="lock-now-btn" id="lockNowBtn" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+        נעילה
+      </button>
     </div>
   </aside>
 
@@ -1466,6 +1474,269 @@
   <button class="lightbox-close" id="lightboxClose">×</button>
   <img id="lightboxImg" src="" alt="קבלה">
 </div>
+
+<!-- ===== PIN LOCK ===== -->
+<style>
+  .lock-screen{
+    position:fixed; inset:0; z-index:1000;
+    display:flex; align-items:center; justify-content:center;
+    padding: 24px 16px;
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 100% 0%, rgba(30,63,122,0.07), transparent 45%),
+      radial-gradient(circle at 0% 100%, rgba(79,143,114,0.07), transparent 40%);
+  }
+  html.unlocked .lock-screen{ display:none; }
+  .lock-card{
+    width:100%; max-width:340px;
+    background: var(--surface);
+    border:1px solid var(--border-soft);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 30px 26px 24px;
+    text-align:center;
+  }
+  .lock-card .brand-logo{ width:96px; margin:0 auto 14px; }
+  .lock-title{ font-size:22px; font-weight:700; color: var(--text); margin-bottom:6px; }
+  .lock-sub{ font-size:13px; color: var(--text-dim); margin-bottom:20px; line-height:1.5; }
+  .lock-input{
+    width:100%;
+    background: var(--bg-alt);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding: 12px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:22px;
+    letter-spacing:10px;
+    text-align:center;
+    direction:ltr;
+    color: var(--text);
+    outline:none;
+    margin-bottom:10px;
+  }
+  .lock-input:focus{ border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .lock-error{ min-height:20px; font-size:12.5px; color: var(--red); margin-bottom:10px; }
+  .lock-card .submit-btn{ width:100%; }
+  .lock-card .submit-btn:disabled{ opacity:.55; cursor:default; filter:none; }
+  .lock-link{
+    margin-top:16px;
+    background:none; border:none;
+    font-family:'Heebo', sans-serif; font-size:12.5px;
+    color: var(--text-faint);
+    text-decoration:underline;
+    cursor:pointer;
+  }
+  .lock-danger{ background: var(--red) !important; margin-top:8px; }
+  .lock-secondary{
+    width:100%; margin-top:8px;
+    background: var(--surface-2); color: var(--text);
+    border:1px solid var(--border);
+    font-family:'Heebo', sans-serif; font-weight:600; font-size:14.5px;
+    padding: 11px 26px; border-radius:7px; cursor:pointer;
+  }
+  .lock-now-btn{
+    display:flex; align-items:center; justify-content:center; gap:7px;
+    background: transparent;
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding: 9px 12px;
+    color: var(--text-dim);
+    font-family:'Heebo', sans-serif; font-size:13px; font-weight:500;
+    cursor:pointer;
+  }
+  .lock-now-btn:hover{ background: var(--surface-2); color: var(--text); }
+  @media (max-width: 880px){
+    .lock-now-btn{ flex:1 1 100%; }
+  }
+</style>
+
+<div class="lock-screen" id="lockScreen">
+  <form class="lock-card" id="lockForm" autocomplete="off">
+    <img class="brand-logo" id="lockLogo" alt="נאלה">
+    <div class="lock-title display" id="lockTitle">נאלה</div>
+    <div class="lock-sub" id="lockSub"></div>
+    <input class="lock-input" id="lockInput" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off">
+    <div class="lock-error" id="lockError"></div>
+    <button class="submit-btn" id="lockSubmit" type="submit">המשך</button>
+    <button class="submit-btn lock-danger" id="lockWipe" type="button" hidden>מחיקת כל הנתונים</button>
+    <button class="lock-secondary" id="lockCancel" type="button" hidden>ביטול</button>
+    <button class="lock-link" id="lockForgot" type="button" hidden>שכחתי את הקוד</button>
+  </form>
+</div>
+
+<script>
+(function(){
+  // The PIN is chosen on each device and only a salted PBKDF2 hash is kept in
+  // localStorage, so nothing secret lives in this (public) source file.
+  const PIN_KEY = 'naale_pin';
+  const ITERATIONS = 150000;
+  const RELOCK_AFTER_MS = 5 * 60 * 1000; // re-lock after 5 minutes in the background
+  const MAX_TRIES = 5;
+  const COOLDOWN_MS = 30 * 1000;
+
+  const $ = (id) => document.getElementById(id);
+  const screen = $('lockScreen'), form = $('lockForm'), input = $('lockInput');
+  const title = $('lockTitle'), sub = $('lockSub'), error = $('lockError');
+  const submit = $('lockSubmit'), forgot = $('lockForgot');
+  const wipe = $('lockWipe'), cancel = $('lockCancel');
+
+  const logo = document.querySelector('.sidebar .brand-logo');
+  if(logo) $('lockLogo').src = logo.src; else $('lockLogo').remove();
+
+  let mode = 'unlock';      // 'create' | 'confirm' | 'unlock' | 'forgot'
+  let firstPin = '';
+  let tries = 0;
+  let cooldownUntil = 0;
+  let hiddenAt = null;
+
+  const COOLDOWN_MSG = 'יותר מדי ניסיונות. נסי שוב בעוד 30 שניות.';
+  const inCooldown = () => Date.now() < cooldownUntil;
+
+  const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+  const fromHex = (hex) => new Uint8Array(hex.match(/../g).map(h => parseInt(h, 16)));
+
+  async function hashPin(pin, saltHex, iterations){
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+      {name:'PBKDF2', hash:'SHA-256', salt: fromHex(saltHex), iterations}, key, 256);
+    return toHex(bits);
+  }
+
+  function readStored(){
+    try{ return JSON.parse(localStorage.getItem(PIN_KEY) || 'null'); }catch(e){ return null; }
+  }
+
+  function setMode(next){
+    mode = next;
+    input.value = '';
+    error.textContent = '';
+    const isForgot = next === 'forgot';
+    input.hidden = isForgot;
+    submit.hidden = isForgot;
+    wipe.hidden = cancel.hidden = !isForgot;
+    forgot.hidden = next !== 'unlock';
+    if(next === 'create'){
+      title.textContent = 'בחירת קוד';
+      sub.textContent = 'בחרי קוד של 4–8 ספרות. הקוד נשמר רק במכשיר הזה ויידרש בכל כניסה.';
+      submit.textContent = 'המשך';
+    }else if(next === 'confirm'){
+      title.textContent = 'אימות הקוד';
+      sub.textContent = 'הקלידי את הקוד שוב.';
+      submit.textContent = 'שמירה';
+    }else if(next === 'unlock'){
+      title.textContent = 'נאלה';
+      sub.textContent = 'הקלידי את הקוד כדי להיכנס.';
+      submit.textContent = 'כניסה';
+    }else{
+      title.textContent = 'שכחת את הקוד?';
+      sub.textContent = 'אין דרך לשחזר את הקוד. אפשר למחוק את כל הנתונים במכשיר הזה ולהתחיל מחדש עם קוד חדש. לא ניתן לבטל פעולה זו.';
+    }
+    if(next === 'unlock' && inCooldown()) error.textContent = COOLDOWN_MSG;
+    if(!isForgot) setTimeout(() => input.focus(), 50);
+  }
+
+  function lock(){
+    document.documentElement.classList.remove('unlocked');
+    setMode(readStored() ? 'unlock' : 'create');
+  }
+
+  function unlock(){
+    tries = 0;
+    document.documentElement.classList.add('unlocked');
+    input.value = '';
+    input.blur();
+  }
+
+  async function onSubmit(e){
+    e.preventDefault();
+    if(inCooldown()){
+      error.textContent = COOLDOWN_MSG;
+      return;
+    }
+    const pin = input.value.trim();
+    if(!/^\d{4,8}$/.test(pin)){
+      error.textContent = 'הקוד צריך להיות 4–8 ספרות.';
+      return;
+    }
+    if(!(window.crypto && crypto.subtle)){
+      error.textContent = 'הדפדפן הזה לא תומך בנעילה. יש לפתוח את האתר בכתובת https.';
+      return;
+    }
+    submit.disabled = true;
+    try{
+      if(mode === 'create'){
+        firstPin = pin;
+        setMode('confirm');
+      }else if(mode === 'confirm'){
+        if(pin !== firstPin){
+          firstPin = '';
+          setMode('create');
+          error.textContent = 'הקודים לא תואמים. נסי שוב.';
+          return;
+        }
+        const salt = toHex(crypto.getRandomValues(new Uint8Array(16)));
+        const hash = await hashPin(pin, salt, ITERATIONS);
+        localStorage.setItem(PIN_KEY, JSON.stringify({salt, hash, iterations: ITERATIONS}));
+        firstPin = '';
+        unlock();
+      }else if(mode === 'unlock'){
+        const stored = readStored();
+        if(!stored){ setMode('create'); return; }
+        const hash = await hashPin(pin, stored.salt, stored.iterations || ITERATIONS);
+        if(hash === stored.hash){
+          unlock();
+        }else{
+          tries++;
+          input.value = '';
+          if(tries >= MAX_TRIES){
+            tries = 0;
+            cooldownUntil = Date.now() + COOLDOWN_MS;
+            error.textContent = COOLDOWN_MSG;
+            input.disabled = true;
+            setTimeout(() => {
+              input.disabled = false;
+              if(error.textContent === COOLDOWN_MSG) error.textContent = '';
+              input.focus();
+            }, COOLDOWN_MS);
+          }else{
+            error.textContent = 'קוד שגוי.';
+          }
+        }
+      }
+    }catch(err){
+      console.error('שגיאת נעילה', err);
+      error.textContent = 'משהו השתבש. נסי שוב.';
+    }finally{
+      submit.disabled = false;
+    }
+  }
+
+  function wipeEverything(){
+    try{
+      Object.keys(localStorage)
+        .filter(k => k.startsWith('ledger_') || k === PIN_KEY)
+        .forEach(k => localStorage.removeItem(k));
+    }catch(e){}
+    location.reload();
+  }
+
+  form.addEventListener('submit', onSubmit);
+  forgot.addEventListener('click', () => setMode('forgot'));
+  cancel.addEventListener('click', () => setMode('unlock'));
+  wipe.addEventListener('click', wipeEverything);
+  $('lockNowBtn').addEventListener('click', lock);
+
+  document.addEventListener('visibilitychange', () => {
+    if(document.hidden){
+      hiddenAt = Date.now();
+    }else if(hiddenAt && Date.now() - hiddenAt > RELOCK_AFTER_MS){
+      lock();
+    }
+  });
+
+  lock();
+})();
+</script>
 
 <div class="toast" id="toast">
   <span id="toastMsg"></span>
